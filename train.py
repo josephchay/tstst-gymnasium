@@ -97,8 +97,8 @@ elif option == 7:
 elif option == 8:
     limit_step = 700
     limit_eval = 700
-    env = gym.make('LunarLanderContinuous-v2')
-    env_test = gym.make('LunarLanderContinuous-v2')
+    env = gym.make('LunarLanderContinuous-v3')
+    env_test = gym.make('LunarLanderContinuous-v3')
 
 elif option == 9:
     limit_step = 300
