@@ -1,4 +1,4 @@
-#This is the enhanced Symphony algorithm with conservative improvements.
+#This is the enhanced Symphony algorithm with conservative improvements and device compatibility fixes.
 #Focuses on proven techniques: better sampling, improved noise schedules, and stability enhancements.
 
 import torch
@@ -83,7 +83,7 @@ class Critic(nn.Module):
         qmin = torch.min(torch.stack(xs[:3], dim=-1), dim=-1).values
         return qmin, xs[3]
 
-# Enhanced Replay Buffer with better sampling strategies
+# Enhanced Replay Buffer with better sampling strategies and device compatibility
 class EnhancedReplayBuffer:
     def __init__(self, state_dim, action_dim, capacity, device, fade_factor=7.0, stall_penalty=0.03):
         capacity_dict = {"short": 100000, "medium": 300000, "full": 500000}
@@ -94,14 +94,12 @@ class EnhancedReplayBuffer:
         self.fade_factor = fade_factor
         self.stall_penalty = stall_penalty
         
+        # Ensure all tensors are on the correct device
         self.states = torch.zeros((self.capacity, state_dim), dtype=torch.float32).to(device)
         self.actions = torch.zeros((self.capacity, action_dim), dtype=torch.float32).to(device)
         self.rewards = torch.zeros((self.capacity, 1), dtype=torch.float32).to(device)
         self.next_states = torch.zeros((self.capacity, state_dim), dtype=torch.float32).to(device)
         self.dones = torch.zeros((self.capacity, 1), dtype=torch.float32).to(device)
-        
-        # Add importance weights for better sampling
-        self.priorities = torch.ones((self.capacity,), dtype=torch.float32).to(device)
         
         self.raw = True
 
@@ -131,25 +129,18 @@ class EnhancedReplayBuffer:
             self.length += 1
         
         index = self.step % self.capacity
+        # Ensure tensors are on the correct device when adding
         self.states[index] = torch.FloatTensor(state).to(self.device)
         self.actions[index] = torch.FloatTensor(action).to(self.device)
         self.rewards[index] = torch.FloatTensor([reward]).to(self.device)
         self.next_states[index] = torch.FloatTensor(next_state).to(self.device)
         self.dones[index] = torch.FloatTensor([done]).to(self.device)
         
-        # Initialize priority for new transitions
-        self.priorities[index] = self.priorities[:self.length].max() if self.length > 1 else 1.0
-        
         self.step += 1
         if self.length > 100: 
             self.batch_size = min(max(128, self.length//500), 1024)
 
-    def update_priorities(self, indices, priorities):
-        """Update priorities for sampled transitions"""
-        if len(indices) > 0:
-            self.priorities[indices] = torch.FloatTensor(priorities).to(self.device) + 1e-6
-
-    def generate_probs(self, uniform=False, prioritized=False):
+    def generate_probs(self, uniform=False):
         if self.length <= 0:
             self.indexes = np.array([])
             return None
@@ -158,28 +149,20 @@ class EnhancedReplayBuffer:
             self.indexes = np.arange(self.length)
             return None
 
-        if self.length >= self.capacity and hasattr(self, 'probs') and not prioritized: 
+        if self.length >= self.capacity and hasattr(self, 'probs'): 
             return self.probs
 
         def fade(norm_index): 
             return np.tanh(self.fade_factor*norm_index**2)
         
         self.indexes = np.arange(self.length)
-        
-        if prioritized:
-            # Use priority-based sampling
-            priorities = self.priorities[:self.length].cpu().numpy()
-            weights = priorities ** 0.6  # Priority exponent
-        else:
-            # Use temporal fading
-            weights = 1e-7 * fade(self.indexes/self.length)
-        
+        weights = 1e-7 * fade(self.indexes/self.length)
         self.probs = weights / np.sum(weights)
         return self.probs
 
-    def sample(self, uniform=False, prioritized=False):
+    def sample(self, uniform=False):
         if self.length == 0:
-            # Return empty tensors with correct dimensions
+            # Return empty tensors with correct dimensions on the right device
             return (
                 torch.zeros((0, self.states.shape[1])).to(self.device),
                 torch.zeros((0, self.actions.shape[1])).to(self.device),
@@ -189,31 +172,36 @@ class EnhancedReplayBuffer:
             )
         
         actual_batch_size = min(self.batch_size, self.length)
-        probs = self.generate_probs(uniform, prioritized)
+        probs = self.generate_probs(uniform)
         
-        indices = self.random.choice(self.indexes, p=probs, size=actual_batch_size)
+        if len(self.indexes) == 0:
+            # Fallback: return first few samples if indexes are empty
+            indices = np.arange(min(actual_batch_size, self.length))
+        else:
+            indices = self.random.choice(self.indexes, p=probs, size=actual_batch_size)
         
+        # Ensure all returned tensors are on the correct device
         return (
-            self.normalize(self.states[indices]),
-            self.actions[indices],
-            self.rewards[indices],
-            self.normalize(self.next_states[indices]),
-            self.dones[indices]
+            self.normalize(self.states[indices]).to(self.device),
+            self.actions[indices].to(self.device),
+            self.rewards[indices].to(self.device),
+            self.normalize(self.next_states[indices]).to(self.device),
+            self.dones[indices].to(self.device)
         )
 
     def __len__(self):
         return self.length
 
-# Enhanced Symphony algorithm
+# Enhanced Symphony algorithm with device compatibility
 class Symphony(object):
     def __init__(self, state_dim, action_dim, hidden_dim, device, max_action=1.0, burst=False, tr_noise=True):
         self.actor = Actor(state_dim, action_dim, device, hidden_dim, max_action, burst, tr_noise).to(device)
         self.critic = Critic(state_dim, action_dim, hidden_dim).to(device)
         self.critic_target = copy.deepcopy(self.critic)
         
-        # Enhanced optimizers with gradient clipping
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4, weight_decay=1e-5)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=7e-4, weight_decay=1e-5)
+        # Enhanced optimizers
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=7e-4)
         
         self.max_action = max_action
         self.device = device
@@ -222,10 +210,6 @@ class Symphony(object):
         self.q_old_policy = 0.0
         self.s2_old_policy = 0.0
         self.tr_step = 0
-        
-        # Enhanced training parameters
-        self.grad_clip_value = 1.0
-        self.target_update_freq = 2
 
     def select_action(self, state, replay_buffer=None, mean=False):
         with torch.no_grad():
@@ -234,27 +218,30 @@ class Symphony(object):
             action = self.actor(state, mean=mean)
             return action.cpu().data.numpy().flatten()
 
-    def train(self, batch, replay_buffer=None):
+    def train(self, batch):
         self.tr_step += 1
         state, action, reward, next_state, done = batch
+        
+        # FIX: Ensure all batch tensors are on the correct device
+        state = state.to(self.device)
+        action = action.to(self.device) 
+        reward = reward.to(self.device)
+        next_state = next_state.to(self.device)
+        done = done.to(self.device)
         
         # Skip training if batch is empty
         if state.size(0) == 0:
             return torch.tensor(0.0)
         
-        critic_loss = self.critic_update(state, action, reward, next_state, done)
-        actor_loss = self.actor_update(state, next_state)
-        
-        return actor_loss
+        self.critic_update(state, action, reward, next_state, done)
+        return self.actor_update(state, next_state)
 
     def critic_update(self, state, action, reward, next_state, done):
-        # Enhanced target update with less frequent updates
-        if self.tr_step % self.target_update_freq == 0:
-            with torch.no_grad():
-                for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-                    target_param.data.copy_(0.995*target_param.data + 0.005*param)
-        
+        # Enhanced target update
         with torch.no_grad():
+            for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                target_param.data.copy_(0.997*target_param.data + 0.003*param)
+        
             next_action = self.actor(next_state, mean=True)
             q_next_target, s2_next_target = self.critic_target(next_state, next_action, united=True)
             q_value = reward + (1-done) * 0.99 * q_next_target
@@ -271,11 +258,7 @@ class Symphony(object):
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_value)
         self.critic_optimizer.step()
-        
-        return critic_loss
 
     def actor_update(self, state, next_state):
         action = self.actor(state, mean=True)
@@ -291,8 +274,6 @@ class Symphony(object):
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_value)
         self.actor_optimizer.step()
 
         with torch.no_grad():
@@ -316,7 +297,7 @@ class EnhancedNoise:
         
         # Enhanced noise parameters
         self.min_noise = 0.05
-        self.exploration_phase_end = 1.5  # Extend exploration slightly
+        self.exploration_phase_end = 1.5
 
     def generate(self, x):
         if self.tr_noise and self.x_coor >= 2.133: 

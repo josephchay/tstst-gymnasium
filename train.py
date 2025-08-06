@@ -32,10 +32,6 @@ fade_factor = 7
 stall_penalty = 0.07
 capacity = "full"
 
-# Enhanced training parameters
-use_prioritized_sampling = False  # Can be enabled for harder environments
-adaptive_training_schedule = True  # Adjust training frequency based on performance
-
 if option == -1:
     env = gym.make('Pendulum-v1')
     env_test = gym.make('Pendulum-v1', render_mode="human")
@@ -127,27 +123,35 @@ def testing(env, limit_step, test_episodes):
         validate_return = np.mean(episode_return[-100:])
         print(f"trial {test_episode}: Rtrn = {episode_return[test_episode]:.2f}, Average 100 = {validate_return:.2f}, steps: {steps}")
 
-# Loading existing models and replay buffer
+# Enhanced loading with device compatibility
 try:
     print("loading buffer...")
     with open('replay_buffer', 'rb') as file:
         dict = pickle.load(file)
         algo.actor.noise.x_coor = dict['x_coor']
         
-        # Handle both old and new buffer formats
+        # Handle both old and new buffer formats with device transfer
         old_buffer = dict['buffer']
-        if hasattr(old_buffer, 'priorities'):
-            replay_buffer = old_buffer  # New format
+        if hasattr(old_buffer, 'device'):
+            # New format - ensure correct device
+            replay_buffer = old_buffer
+            replay_buffer.states = replay_buffer.states.to(device)
+            replay_buffer.actions = replay_buffer.actions.to(device)
+            replay_buffer.rewards = replay_buffer.rewards.to(device)
+            replay_buffer.next_states = replay_buffer.next_states.to(device)
+            replay_buffer.dones = replay_buffer.dones.to(device)
+            replay_buffer.device = device
         else:
             # Convert old format to new format
             replay_buffer = ReplayBuffer(state_dim, action_dim, capacity, device, fade_factor, stall_penalty)
             if hasattr(old_buffer, 'states') and len(old_buffer) > 0:
                 copy_length = min(len(old_buffer), replay_buffer.capacity)
-                replay_buffer.states[:copy_length] = old_buffer.states[:copy_length]
-                replay_buffer.actions[:copy_length] = old_buffer.actions[:copy_length]
-                replay_buffer.rewards[:copy_length] = old_buffer.rewards[:copy_length]
-                replay_buffer.next_states[:copy_length] = old_buffer.next_states[:copy_length]
-                replay_buffer.dones[:copy_length] = old_buffer.dones[:copy_length]
+                # Ensure device compatibility during copying
+                replay_buffer.states[:copy_length] = old_buffer.states[:copy_length].to(device)
+                replay_buffer.actions[:copy_length] = old_buffer.actions[:copy_length].to(device)
+                replay_buffer.rewards[:copy_length] = old_buffer.rewards[:copy_length].to(device)
+                replay_buffer.next_states[:copy_length] = old_buffer.next_states[:copy_length].to(device)
+                replay_buffer.dones[:copy_length] = old_buffer.dones[:copy_length].to(device)
                 replay_buffer.length = copy_length
                 replay_buffer.step = copy_length
         
@@ -164,40 +168,24 @@ except:
 
 try:
     print("loading models...")
-    algo.actor.load_state_dict(torch.load('actor_model.pt', weights_only=True))
-    algo.critic.load_state_dict(torch.load('critic_model.pt', weights_only=True))
-    algo.critic_target.load_state_dict(torch.load('critic_target_model.pt', weights_only=True))
+    # Use weights_only=True for security and compatibility
+    algo.actor.load_state_dict(torch.load('actor_model.pt', map_location=device, weights_only=True))
+    algo.critic.load_state_dict(torch.load('critic_model.pt', map_location=device, weights_only=True))
+    algo.critic_target.load_state_dict(torch.load('critic_target_model.pt', map_location=device, weights_only=True))
     print('models loaded')
     testing(env_test, limit_eval, 10)
 except:
     print("problem during loading models")
 
-# Enhanced performance tracking
-recent_rewards = []
-performance_trend = 0
-stagnation_counter = 0
-
-# Training loop
+# Training loop with enhanced error handling
 for i in range(start_episode, num_episodes):
     rewards = []
     state = env.reset()[0]
     
-    # Enhanced adaptive training between episodes
+    # Adaptive training between episodes
     rb_len = len(replay_buffer)
     rb_len_threshold = 5000*tr_between_ep_init
     tr_between_ep = tr_between_ep_init
-    
-    if adaptive_training_schedule and Q_learning:
-        # Adjust training frequency based on recent performance
-        if len(recent_rewards) >= 10:
-            current_avg = np.mean(recent_rewards[-10:])
-            older_avg = np.mean(recent_rewards[-20:-10]) if len(recent_rewards) >= 20 else current_avg
-            performance_trend = current_avg - older_avg
-            
-            if performance_trend > 0:  # Improving
-                tr_between_ep = max(tr_between_ep_init // 2, tr_between_ep - 5)
-            elif performance_trend < -50:  # Declining significantly
-                tr_between_ep = min(tr_between_ep_init * 2, tr_between_ep + 10)
     
     if not tr_between_ep_const and tr_between_ep_init >= 100 and rb_len >= 350000: 
         tr_between_ep = rb_len//5000
@@ -212,14 +200,11 @@ for i in range(start_episode, num_episodes):
         _ = [algo.actor.apply(init_weights) for x in range(7)]
         print("Actor reinitialized to decrease dependence on random seed")
     
-    # Training between episodes with enhanced sampling
-    if Q_learning and rb_len > 128:  # Safety check
+    # Training between episodes with safety checks
+    if Q_learning and rb_len >= 128:  # Safety check
         for _ in range(tr_between_ep):
-            if use_prioritized_sampling and hasattr(replay_buffer, 'sample'):
-                batch = replay_buffer.sample(prioritized=True)
-            else:
-                batch = replay_buffer.sample()
-            algo.train(batch, replay_buffer)
+            batch = replay_buffer.sample()
+            algo.train(batch)
     
     # Episode execution
     for episode_steps in range(1, limit_step+1):
@@ -229,10 +214,10 @@ for i in range(start_episode, num_episodes):
             print("started training")
             Q_learning = True
             
-            # Safe initial training
+            # Safe initial training with proper checks
             if rb_len >= 128:
-                _ = [algo.train(replay_buffer.sample(uniform=True), replay_buffer) for x in range(64)]
-                _ = [algo.train(replay_buffer.sample(), replay_buffer) for x in range(64)]
+                _ = [algo.train(replay_buffer.sample(uniform=True)) for x in range(64)]
+                _ = [algo.train(replay_buffer.sample()) for x in range(64)]
         
         action = algo.select_action(state, replay_buffer)
         next_state, reward, done, info, _ = env.step(action)
@@ -255,27 +240,18 @@ for i in range(start_episode, num_episodes):
         if Q_learning and rb_len >= 128:
             for _ in range(tr_per_step):
                 batch = replay_buffer.sample()
-                algo.train(batch, replay_buffer)
+                algo.train(batch)
         
         state = next_state
         if done: 
             break
     
     total_rewards.append(np.sum(rewards))
-    recent_rewards.append(np.sum(rewards))
-    if len(recent_rewards) > 100:
-        recent_rewards.pop(0)
-        
     average_reward = np.mean(total_rewards[-100:])
     total_steps.append(episode_steps)
     average_steps = np.mean(total_steps[-100:])
     
-    # Enhanced progress reporting
-    trend_info = ""
-    if len(recent_rewards) >= 20:
-        trend_info = f"| Trend: {performance_trend:+.1f}"
-    
-    print(f"Ep {i}: Rtrn = {total_rewards[-1]:.2f} | ep steps = {episode_steps} {trend_info}")
+    print(f"Ep {i}: Rtrn = {total_rewards[-1]:.2f} | ep steps = {episode_steps}")
     
     if Q_learning:
         # Saving models and buffer
