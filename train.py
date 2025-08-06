@@ -6,7 +6,7 @@ import numpy as np
 import gymnasium as gym
 import pickle
 import time
-from symphony import Symphony, EnhancedReplayBuffer as ReplayBuffer
+from symphony import Symphony, ReplayBuffer
 import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,10 +32,9 @@ fade_factor = 7
 stall_penalty = 0.07
 capacity = "full"
 
-# Model-based training parameters
-use_balanced_sampling = True  # Use balanced real/dream sampling
-dream_frequency = 100         # Generate dreams every N episodes
-model_training_start = 10000  # Start model training after N transitions
+# Enhanced training parameters
+use_prioritized_sampling = False  # Can be enabled for harder environments
+adaptive_training_schedule = True  # Adjust training frequency based on performance
 
 if option == -1:
     env = gym.make('Pendulum-v1')
@@ -135,22 +134,22 @@ try:
         dict = pickle.load(file)
         algo.actor.noise.x_coor = dict['x_coor']
         
-        # Handle legacy replay buffer
+        # Handle both old and new buffer formats
         old_buffer = dict['buffer']
-        replay_buffer = ReplayBuffer(state_dim, action_dim, capacity, device, fade_factor, stall_penalty)
-        
-        # Copy data from old buffer if it exists
-        if hasattr(old_buffer, 'states') and len(old_buffer) > 0:
-            copy_length = min(len(old_buffer), replay_buffer.capacity)
-            replay_buffer.states[:copy_length] = old_buffer.states[:copy_length]
-            replay_buffer.actions[:copy_length] = old_buffer.actions[:copy_length]
-            replay_buffer.rewards[:copy_length] = old_buffer.rewards[:copy_length]
-            replay_buffer.next_states[:copy_length] = old_buffer.next_states[:copy_length]
-            replay_buffer.dones[:copy_length] = old_buffer.dones[:copy_length]
-            replay_buffer.length = copy_length
-            replay_buffer.step = copy_length
-            # All loaded data is real data (backward compatibility)
-            replay_buffer.is_real[:copy_length] = True
+        if hasattr(old_buffer, 'priorities'):
+            replay_buffer = old_buffer  # New format
+        else:
+            # Convert old format to new format
+            replay_buffer = ReplayBuffer(state_dim, action_dim, capacity, device, fade_factor, stall_penalty)
+            if hasattr(old_buffer, 'states') and len(old_buffer) > 0:
+                copy_length = min(len(old_buffer), replay_buffer.capacity)
+                replay_buffer.states[:copy_length] = old_buffer.states[:copy_length]
+                replay_buffer.actions[:copy_length] = old_buffer.actions[:copy_length]
+                replay_buffer.rewards[:copy_length] = old_buffer.rewards[:copy_length]
+                replay_buffer.next_states[:copy_length] = old_buffer.next_states[:copy_length]
+                replay_buffer.dones[:copy_length] = old_buffer.dones[:copy_length]
+                replay_buffer.length = copy_length
+                replay_buffer.step = copy_length
         
         total_rewards = dict['total_rewards']
         total_steps = dict['total_steps']
@@ -165,37 +164,46 @@ except:
 
 try:
     print("loading models...")
-    algo.actor.load_state_dict(torch.load('actor_model.pt'))
-    algo.critic.load_state_dict(torch.load('critic_model.pt'))
-    algo.critic_target.load_state_dict(torch.load('critic_target_model.pt'))
-    
-    # Try to load environment model if it exists
-    try:
-        algo.env_model.load_state_dict(torch.load('env_model.pt'))
-        print('environment model loaded')
-    except:
-        print("no environment model found, starting fresh")
-    
+    algo.actor.load_state_dict(torch.load('actor_model.pt', weights_only=True))
+    algo.critic.load_state_dict(torch.load('critic_model.pt', weights_only=True))
+    algo.critic_target.load_state_dict(torch.load('critic_target_model.pt', weights_only=True))
     print('models loaded')
     testing(env_test, limit_eval, 10)
 except:
     print("problem during loading models")
+
+# Enhanced performance tracking
+recent_rewards = []
+performance_trend = 0
+stagnation_counter = 0
 
 # Training loop
 for i in range(start_episode, num_episodes):
     rewards = []
     state = env.reset()[0]
     
-    # Adaptive training between episodes
+    # Enhanced adaptive training between episodes
     rb_len = len(replay_buffer)
-    rb_len_treshold = 5000*tr_between_ep_init
+    rb_len_threshold = 5000*tr_between_ep_init
     tr_between_ep = tr_between_ep_init
+    
+    if adaptive_training_schedule and Q_learning:
+        # Adjust training frequency based on recent performance
+        if len(recent_rewards) >= 10:
+            current_avg = np.mean(recent_rewards[-10:])
+            older_avg = np.mean(recent_rewards[-20:-10]) if len(recent_rewards) >= 20 else current_avg
+            performance_trend = current_avg - older_avg
+            
+            if performance_trend > 0:  # Improving
+                tr_between_ep = max(tr_between_ep_init // 2, tr_between_ep - 5)
+            elif performance_trend < -50:  # Declining significantly
+                tr_between_ep = min(tr_between_ep_init * 2, tr_between_ep + 10)
     
     if not tr_between_ep_const and tr_between_ep_init >= 100 and rb_len >= 350000: 
         tr_between_ep = rb_len//5000
-    if not tr_between_ep_const and tr_between_ep_init < 100 and rb_len >= rb_len_treshold: 
+    if not tr_between_ep_const and tr_between_ep_init < 100 and rb_len >= rb_len_threshold: 
         tr_between_ep = rb_len//5000
-    
+
     if Q_learning: 
         time.sleep(0.5)
     
@@ -204,19 +212,14 @@ for i in range(start_episode, num_episodes):
         _ = [algo.actor.apply(init_weights) for x in range(7)]
         print("Actor reinitialized to decrease dependence on random seed")
     
-    # Training between episodes with mixed sampling
-    if Q_learning:
-        # Use balanced sampling for more stable learning
-        if use_balanced_sampling and hasattr(replay_buffer, 'balanced_sample'):
-            dream_data_available = len(replay_buffer.get_real_dream_indices()[1]) > 0
-            for _ in range(tr_between_ep//2):
-                if dream_data_available and np.random.random() < 0.3:  # 30% chance to use balanced sampling
-                    batch = replay_buffer.balanced_sample()
-                else:
-                    batch = replay_buffer.sample()
-                algo.train(batch, replay_buffer)
-        else:
-            _ = [algo.train(replay_buffer.sample(), replay_buffer) for x in range(tr_between_ep)]
+    # Training between episodes with enhanced sampling
+    if Q_learning and rb_len > 128:  # Safety check
+        for _ in range(tr_between_ep):
+            if use_prioritized_sampling and hasattr(replay_buffer, 'sample'):
+                batch = replay_buffer.sample(prioritized=True)
+            else:
+                batch = replay_buffer.sample()
+            algo.train(batch, replay_buffer)
     
     # Episode execution
     for episode_steps in range(1, limit_step+1):
@@ -225,8 +228,11 @@ for i in range(start_episode, num_episodes):
             replay_buffer.find_min_max()
             print("started training")
             Q_learning = True
-            _ = [algo.train(replay_buffer.sample(uniform=True), replay_buffer) for x in range(64)]
-            _ = [algo.train(replay_buffer.sample(), replay_buffer) for x in range(64)]
+            
+            # Safe initial training
+            if rb_len >= 128:
+                _ = [algo.train(replay_buffer.sample(uniform=True), replay_buffer) for x in range(64)]
+                _ = [algo.train(replay_buffer.sample(), replay_buffer) for x in range(64)]
         
         action = algo.select_action(state, replay_buffer)
         next_state, reward, done, info, _ = env.step(action)
@@ -243,17 +249,12 @@ for i in range(start_episode, num_episodes):
         elif env.spec.id.find("BipedalWalkerHardcore") != -1:
             if reward == -100.0: reward = -25.0
         
-        # Add transition to replay buffer (marked as real data)
-        replay_buffer.add(state, action, reward+1.0, next_state, done, is_real=True)
+        replay_buffer.add(state, action, reward+1.0, next_state, done)
         
-        # Training per step
-        if Q_learning: 
-            # Mix regular and balanced sampling during training
+        # Training per step with safety checks
+        if Q_learning and rb_len >= 128:
             for _ in range(tr_per_step):
-                if use_balanced_sampling and hasattr(replay_buffer, 'balanced_sample') and np.random.random() < 0.2:
-                    batch = replay_buffer.balanced_sample()
-                else:
-                    batch = replay_buffer.sample()
+                batch = replay_buffer.sample()
                 algo.train(batch, replay_buffer)
         
         state = next_state
@@ -261,18 +262,20 @@ for i in range(start_episode, num_episodes):
             break
     
     total_rewards.append(np.sum(rewards))
+    recent_rewards.append(np.sum(rewards))
+    if len(recent_rewards) > 100:
+        recent_rewards.pop(0)
+        
     average_reward = np.mean(total_rewards[-100:])
     total_steps.append(episode_steps)
     average_steps = np.mean(total_steps[-100:])
     
-    # Print episode statistics
-    model_info = ""
-    if hasattr(algo, 'use_model') and algo.use_model:
-        real_indices, dream_indices = replay_buffer.get_real_dream_indices()
-        dream_ratio = len(dream_indices) / len(replay_buffer) if len(replay_buffer) > 0 else 0
-        model_info = f"| Model: ON, Dream: {dream_ratio:.2%}, Usage: {algo.model_usage_ratio:.2f}"
+    # Enhanced progress reporting
+    trend_info = ""
+    if len(recent_rewards) >= 20:
+        trend_info = f"| Trend: {performance_trend:+.1f}"
     
-    print(f"Ep {i}: Rtrn = {total_rewards[-1]:.2f} | ep steps = {episode_steps} {model_info}")
+    print(f"Ep {i}: Rtrn = {total_rewards[-1]:.2f} | ep steps = {episode_steps} {trend_info}")
     
     if Q_learning:
         # Saving models and buffer
@@ -280,7 +283,6 @@ for i in range(start_episode, num_episodes):
             torch.save(algo.actor.state_dict(), 'actor_model.pt')
             torch.save(algo.critic.state_dict(), 'critic_model.pt')
             torch.save(algo.critic_target.state_dict(), 'critic_target_model.pt')
-            torch.save(algo.env_model.state_dict(), 'env_model.pt')
             
             with open('replay_buffer', 'wb') as file:
                 pickle.dump({
