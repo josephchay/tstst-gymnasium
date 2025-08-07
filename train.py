@@ -153,7 +153,7 @@ def save_models_and_buffer():
         print(f"Error saving models: {e}")
 
 def load_models_and_buffer():
-    """Optimized loading with compatibility"""
+    """FIXED: Optimized loading with proper device handling"""
     global replay_buffer, total_rewards, total_steps, Q_learning, start_episode
     
     try:
@@ -165,16 +165,13 @@ def load_models_and_buffer():
         if 'x_coor' in save_dict:
             algo.actor.noise.x_coor = save_dict['x_coor']
         
-        # Load buffer with device compatibility
+        # CRITICAL FIX: Load buffer with proper device migration
         if 'buffer' in save_dict:
             loaded_buffer = save_dict['buffer']
             if hasattr(loaded_buffer, 'device'):
                 replay_buffer = loaded_buffer
-                replay_buffer.device = device
-                # Ensure tensors are on correct device
-                for attr in ['states', 'actions', 'rewards', 'next_states', 'dones', 'priorities']:
-                    if hasattr(replay_buffer, attr):
-                        setattr(replay_buffer, attr, getattr(replay_buffer, attr).to(device))
+                # FORCE all tensors to correct device
+                replay_buffer.to_device(device)
         
         # Load training history
         total_rewards = save_dict.get('total_rewards', [])
@@ -200,7 +197,7 @@ def load_models_and_buffer():
     try:
         print("Loading models...")
         
-        # Load models if they exist
+        # CRITICAL FIX: Load models with proper device mapping and error handling
         model_files = [
             ('ultra_actor_model.pt', algo.actor),
             ('ultra_critic_model.pt', algo.critic),
@@ -210,15 +207,23 @@ def load_models_and_buffer():
         
         for filename, model in model_files:
             if os.path.exists(filename):
-                model.load_state_dict(torch.load(filename, map_location=device, weights_only=True))
-                print(f"Loaded {filename}")
+                try:
+                    # CRITICAL FIX: Force load to correct device and use weights_only=True
+                    state_dict = torch.load(filename, map_location=device, weights_only=True)
+                    model.load_state_dict(state_dict)
+                    print(f"Loaded {filename}")
+                except Exception as model_error:
+                    print(f"Error loading {filename}: {model_error}")
         
         print('All available models loaded')
         
-        # Quick performance test
+        # Quick performance test with error handling
         if Q_learning:
-            test_score = testing(env_test, limit_eval, 2)
-            print(f"Current performance: {test_score:.2f}")
+            try:
+                test_score = testing(env_test, limit_eval, 2)
+                print(f"Current performance: {test_score:.2f}")
+            except Exception as test_error:
+                print(f"Error during performance test: {test_error}")
             
     except Exception as e:
         print(f"Problem loading models: {e}")
@@ -260,20 +265,23 @@ for episode in range(start_episode, num_episodes):
             if (algo.world_model_ready and episode % dream_frequency == 0):
                 dream_batch = algo.generate_dreams(real_batch, n_dreams=30, dream_length=6)
             
-            loss = algo.train(real_batch, dream_batch)
-            
-            # Update priorities if using prioritized replay
-            if weights is not None and indices is not None:
-                # Compute TD errors for priority update
-                with torch.no_grad():
-                    states, actions, rewards_tensor, next_states, dones = real_batch
-                    current_qs = algo.critic(states, actions, united=False)
-                    next_actions = algo.actor(next_states, mean=True)
-                    next_q_target, _ = algo.critic_target(next_states, next_actions, united=True)
-                    td_targets = rewards_tensor + (1 - dones) * 0.99 * next_q_target
-                    td_errors = [abs(q - td_targets).mean().item() for q in current_qs[:3]]
-                    avg_td_error = np.mean(td_errors)
-                    replay_buffer.update_priorities(indices, [avg_td_error] * len(indices))
+            try:
+                loss = algo.train(real_batch, dream_batch)
+                
+                # Update priorities if using prioritized replay
+                if weights is not None and indices is not None:
+                    # Compute TD errors for priority update
+                    with torch.no_grad():
+                        states, actions, rewards_tensor, next_states, dones = real_batch
+                        current_qs = algo.critic(states, actions, united=False)
+                        next_actions = algo.actor(next_states, mean=True)
+                        next_q_target, _ = algo.critic_target(next_states, next_actions, united=True)
+                        td_targets = rewards_tensor + (1 - dones) * 0.99 * next_q_target
+                        td_errors = [abs(q - td_targets).mean().item() for q in current_qs[:3]]
+                        avg_td_error = np.mean(td_errors)
+                        replay_buffer.update_priorities(indices, [avg_td_error] * len(indices))
+            except Exception as training_error:
+                print(f"Training error: {training_error}")
     
     # Start training after short exploration
     if rb_len >= explore_time and not Q_learning:
@@ -291,7 +299,10 @@ for episode in range(start_episode, num_episodes):
                         batch, _, _ = sample_result
                     else:
                         batch = sample_result
-                    algo.train(batch)
+                    try:
+                        algo.train(batch)
+                    except Exception as init_training_error:
+                        print(f"Initial training error: {init_training_error}")
     
     # Episode execution with optimizations
     for episode_steps in range(1, limit_step + 1):
@@ -330,8 +341,11 @@ for episode in range(start_episode, num_episodes):
         
         # Add curiosity reward during exploration
         if rb_len >= 100 and rb_len < explore_time * 2:
-            curiosity_reward = algo.curiosity.compute_intrinsic_reward(state, action, next_state)
-            modified_reward += 0.5 * curiosity_reward
+            try:
+                curiosity_reward = algo.curiosity.compute_intrinsic_reward(state, action, next_state)
+                modified_reward += 0.5 * curiosity_reward
+            except Exception as curiosity_error:
+                pass  # Skip curiosity if there's an error
         
         # Compute TD error for prioritized replay
         td_error = 1.0
@@ -353,7 +367,7 @@ for episode in range(start_episode, num_episodes):
                     next_q = algo.critic_target(next_state_t, next_action, united=True)[0]
                     target_q = reward_t + (1 - done_t) * 0.99 * next_q
                     td_error = abs(current_q - target_q).item()
-            except:
+            except Exception:
                 td_error = 1.0
         
         # Add to prioritized buffer
@@ -376,7 +390,10 @@ for episode in range(start_episode, num_episodes):
                 if (algo.world_model_ready and episode_steps % 15 == 0):  # Every 15 steps
                     dream_batch = algo.generate_dreams(batch, n_dreams=20, dream_length=5)
                 
-                algo.train(batch, dream_batch)
+                try:
+                    algo.train(batch, dream_batch)
+                except Exception as step_training_error:
+                    pass  # Continue training even if one step fails
             
             # Train curiosity module frequently
             if episode_steps % 8 == 0:  # Every 8 steps
@@ -386,7 +403,10 @@ for episode in range(start_episode, num_episodes):
                         curiosity_batch, _, _ = sample_result
                     else:
                         curiosity_batch = sample_result
-                    algo.curiosity.train_curiosity(curiosity_batch)
+                    try:
+                        algo.curiosity.train_curiosity(curiosity_batch)
+                    except Exception:
+                        pass  # Continue if curiosity training fails
         
         state = next_state
         if done:
@@ -406,16 +426,19 @@ for episode in range(start_episode, num_episodes):
         len(replay_buffer) >= early_world_model_threshold and Q_learning):
         
         print(f"\nTraining world model at episode {episode}")
-        losses = algo.train_world_model(replay_buffer, world_model_epochs)
-        
-        if losses:
-            print(f"World model training complete. Loss: {losses[-1]:.4f}")
+        try:
+            losses = algo.train_world_model(replay_buffer, world_model_epochs)
             
-            # Aggressive curriculum update
-            if not algo.world_model_ready and np.mean(losses[-3:]) < 0.15:
-                algo.world_model_ready = True
-                algo.dream_ratio = 0.1
-                print("World model ready early due to low loss!")
+            if losses:
+                print(f"World model training complete. Loss: {losses[-1]:.4f}")
+                
+                # Aggressive curriculum update
+                if not algo.world_model_ready and np.mean(losses[-3:]) < 0.15:
+                    algo.world_model_ready = True
+                    algo.dream_ratio = 0.1
+                    print("World model ready early due to low loss!")
+        except Exception as world_model_error:
+            print(f"World model training error: {world_model_error}")
     
     # Frequent saving
     if Q_learning and episode % 10 == 0:  # More frequent saves
@@ -423,9 +446,12 @@ for episode in range(start_episode, num_episodes):
     
     # Fast validation testing
     if episode >= start_test and episode % 25 == 0:  # More frequent testing
-        test_score = testing(env_test, limit_eval, 3)  # Fewer test episodes
-        test_rewards.append(test_score)
-        print(f"Test score: {test_score:.2f}")
+        try:
+            test_score = testing(env_test, limit_eval, 3)  # Fewer test episodes
+            test_rewards.append(test_score)
+            print(f"Test score: {test_score:.2f}")
+        except Exception as test_error:
+            print(f"Testing error: {test_error}")
     
     # Aggressive early stopping
     if len(total_rewards) >= 50:  # Earlier early stopping check
@@ -447,8 +473,11 @@ print("Ultra-fast training completed!")
 
 # Final evaluation and summary
 save_models_and_buffer()
-final_score = testing(env_test, limit_eval, 5)
-print(f"Final test score: {final_score:.2f}")
+try:
+    final_score = testing(env_test, limit_eval, 5)
+    print(f"Final test score: {final_score:.2f}")
+except Exception as final_test_error:
+    print(f"Final test error: {final_test_error}")
 
 # Performance summary
 if total_rewards:

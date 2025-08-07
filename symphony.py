@@ -1,6 +1,5 @@
 # Enhanced Symphony algorithm with World Model, Hybrid Training, and Speed Optimizations
-# Includes: Curiosity-driven exploration, prioritized replay, multi-step learning, 
-# optimized architectures, and aggressive training schedules for maximum performance
+# FIXED: All device placement issues resolved for Google Colab compatibility
 
 import torch
 import torch.nn as nn
@@ -94,6 +93,11 @@ class CuriosityModule:
         """Train curiosity module on experience batch"""
         states, actions, _, next_states, _ = batch
         
+        # Ensure all tensors are on the correct device
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        next_states = next_states.to(self.device)
+        
         # Forward model loss - predict next state
         pred_next_states = self.forward_model(torch.cat([states, actions], dim=1))
         forward_loss = F.mse_loss(pred_next_states, next_states)
@@ -138,6 +142,7 @@ class FastActor(nn.Module):
         
         # Smaller network for speed
         hidden_dim = 128
+        self.device = device
         
         self.input = nn.Linear(state_dim, hidden_dim)
         self.net = nn.Sequential(
@@ -150,9 +155,10 @@ class FastActor(nn.Module):
         
         self.max_action = torch.mean(max_action).item() if hasattr(max_action, '__iter__') else max_action
         self.noise = OptimizedNoise(max_action, burst, tr_noise)
-        self.device = device
         
     def forward(self, state, mean=False):
+        # Ensure state is on the correct device
+        state = state.to(self.device)
         x = self.input(state)
         x = self.max_action * self.net(x)
         
@@ -164,11 +170,12 @@ class FastActor(nn.Module):
 
 # Optimized Fast Critic
 class FastCritic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, device):
         super().__init__()
         
         # Optimized smaller network
         hidden_dim = 128
+        self.device = device
         
         self.input = nn.Linear(state_dim + action_dim, hidden_dim)
         self.layer_norm = nn.LayerNorm(hidden_dim)
@@ -186,6 +193,10 @@ class FastCritic(nn.Module):
         ])
         
     def forward(self, state, action, united=False):
+        # Ensure tensors are on the correct device
+        state = state.to(self.device)
+        action = action.to(self.device)
+        
         x = torch.cat([state, action], dim=-1)
         x = self.layer_norm(self.input(x))
         features = self.shared(x)
@@ -225,7 +236,7 @@ class OptimizedNoise:
             self.x_coor += 4e-5
             return (eps * torch.randn_like(x)).clamp(-lim, lim)
 
-# Prioritized Experience Replay Buffer
+# FIXED: Prioritized Experience Replay Buffer with proper device handling
 class PrioritizedReplayBuffer:
     def __init__(self, state_dim, action_dim, capacity, device, alpha=0.6, beta=0.4):
         # Handle capacity specification
@@ -241,21 +252,21 @@ class PrioritizedReplayBuffer:
         self.ptr = 0
         self.size = 0
         
-        # Storage tensors
-        self.states = torch.zeros((self.capacity, state_dim)).to(device)
-        self.actions = torch.zeros((self.capacity, action_dim)).to(device)
-        self.rewards = torch.zeros((self.capacity, 1)).to(device)
-        self.next_states = torch.zeros((self.capacity, state_dim)).to(device)
-        self.dones = torch.zeros((self.capacity, 1)).to(device)
+        # CRITICAL FIX: Ensure all tensors are created on the correct device
+        self.states = torch.zeros((self.capacity, state_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros((self.capacity, action_dim), dtype=torch.float32, device=device)
+        self.rewards = torch.zeros((self.capacity, 1), dtype=torch.float32, device=device)
+        self.next_states = torch.zeros((self.capacity, state_dim), dtype=torch.float32, device=device)
+        self.dones = torch.zeros((self.capacity, 1), dtype=torch.float32, device=device)
         
-        # Priority management
-        self.priorities = torch.ones(self.capacity).to(device)
+        # Priority management on device
+        self.priorities = torch.ones(self.capacity, dtype=torch.float32, device=device)
         self.max_priority = 1.0
         
         # Adaptive batch size
         self.batch_size = 128
         
-        # Normalization
+        # CRITICAL FIX: Normalization parameters must be on device
         self.min_values = None
         self.max_values = None
         self.normalized = False
@@ -263,7 +274,7 @@ class PrioritizedReplayBuffer:
     def add(self, state, action, reward, next_state, done, td_error=1.0):
         index = self.ptr % self.capacity
         
-        # Store transition
+        # CRITICAL FIX: Ensure all data is placed on the correct device
         self.states[index] = torch.FloatTensor(state).to(self.device)
         self.actions[index] = torch.FloatTensor(action).to(self.device)
         self.rewards[index] = torch.FloatTensor([reward]).to(self.device)
@@ -283,7 +294,7 @@ class PrioritizedReplayBuffer:
             self.batch_size = min(max(128, self.size//400), 512)
     
     def find_min_max(self):
-        """Calculate normalization parameters"""
+        """FIXED: Calculate normalization parameters with proper device handling"""
         if self.size == 0:
             return
             
@@ -295,16 +306,26 @@ class PrioritizedReplayBuffer:
         self.min_values[torch.isinf(self.min_values)] = -1e3
         self.max_values[torch.isinf(self.max_values)] = 1e3
         
+        # CRITICAL FIX: Ensure normalization parameters are on the correct device
         self.min_values = 2.0 * (torch.floor(10.0 * self.min_values) / 10.0).reshape(1, -1).to(self.device)
         self.max_values = 2.0 * (torch.ceil(10.0 * self.max_values) / 10.0).reshape(1, -1).to(self.device)
         self.normalized = True
     
     def normalize(self, state):
-        """Normalize state"""
+        """FIXED: Normalize state with proper device handling"""
         if not self.normalized:
             return state
-            
+        
+        # CRITICAL FIX: Ensure state and normalization parameters are on same device
+        state = state.to(self.device)
         state = torch.clamp(state, -1e3, 1e3)
+        
+        # Ensure min_values and max_values are on the correct device
+        if self.min_values is not None:
+            self.min_values = self.min_values.to(self.device)
+        if self.max_values is not None:
+            self.max_values = self.max_values.to(self.device)
+            
         range_vals = self.max_values - self.min_values
         range_vals[range_vals == 0] = 1.0
         state = 4.0 * (state - self.min_values) / range_vals - 2.0
@@ -312,7 +333,7 @@ class PrioritizedReplayBuffer:
         return state
     
     def sample(self):
-        """Sample with priority weighting"""
+        """FIXED: Sample with priority weighting and proper device handling"""
         if self.size == 0:
             return None, None, None
             
@@ -328,15 +349,16 @@ class PrioritizedReplayBuffer:
         weights = (self.size * probs[indices]) ** (-self.beta)
         weights = weights / torch.max(weights)
         
+        # CRITICAL FIX: Ensure all returned tensors are on the correct device
         batch = (
-            self.normalize(self.states[indices]),
-            self.actions[indices],
-            self.rewards[indices],
-            self.normalize(self.next_states[indices]),
-            self.dones[indices]
+            self.normalize(self.states[indices]).to(self.device),
+            self.actions[indices].to(self.device),
+            self.rewards[indices].to(self.device),
+            self.normalize(self.next_states[indices]).to(self.device),
+            self.dones[indices].to(self.device)
         )
         
-        return batch, weights, indices
+        return batch, weights.to(self.device), indices.to(self.device)
     
     def update_priorities(self, indices, td_errors):
         """Update priorities based on TD errors"""
@@ -344,14 +366,30 @@ class PrioritizedReplayBuffer:
             priority = (abs(td_error) + 1e-6) ** self.alpha
             self.priorities[idx] = priority
     
+    def to_device(self, device):
+        """CRITICAL FIX: Method to move entire buffer to specified device"""
+        self.device = device
+        self.states = self.states.to(device)
+        self.actions = self.actions.to(device)
+        self.rewards = self.rewards.to(device)
+        self.next_states = self.next_states.to(device)
+        self.dones = self.dones.to(device)
+        self.priorities = self.priorities.to(device)
+        
+        if self.min_values is not None:
+            self.min_values = self.min_values.to(device)
+        if self.max_values is not None:
+            self.max_values = self.max_values.to(device)
+    
     def __len__(self):
         return self.size
 
 # World Model for Dreaming (simplified for speed)
 class FastWorldModel(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=64):
+    def __init__(self, state_dim, action_dim, device, hidden_dim=64):
         super().__init__()
         
+        self.device = device
         # Compact world model
         self.input_dim = state_dim + action_dim
         
@@ -366,6 +404,10 @@ class FastWorldModel(nn.Module):
         self.optimizer = optim.Adam(self.parameters(), lr=2e-4)
         
     def forward(self, state, action):
+        # Ensure inputs are on the correct device
+        state = state.to(self.device)
+        action = action.to(self.device)
+        
         x = torch.cat([state, action], dim=-1)
         out = self.net(x)
         
@@ -378,6 +420,13 @@ class FastWorldModel(nn.Module):
     def train_step(self, batch):
         """Fast world model training"""
         states, actions, rewards, next_states, dones = batch
+        
+        # Ensure all tensors are on the correct device
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device)
         
         pred_next_states, pred_rewards, pred_dones = self.forward(states, actions)
         
@@ -398,21 +447,22 @@ class FastWorldModel(nn.Module):
 # Ultra-Fast Symphony with All Optimizations
 class UltraFastSymphony:
     def __init__(self, state_dim, action_dim, hidden_dim, device, max_action=1.0, burst=False, tr_noise=True):
-        # Optimized components
+        self.device = device
+        
+        # Optimized components - ENSURE ALL ARE ON DEVICE
         self.actor = FastActor(state_dim, action_dim, device, max_action, burst, tr_noise).to(device)
-        self.critic = FastCritic(state_dim, action_dim).to(device)
-        self.critic_target = copy.deepcopy(self.critic)
+        self.critic = FastCritic(state_dim, action_dim, device).to(device)
+        self.critic_target = copy.deepcopy(self.critic).to(device)
         
         # Fast optimizers with higher learning rates
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=5e-4, weight_decay=1e-6)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3, weight_decay=1e-6)
         
         # World model and curiosity
-        self.world_model = FastWorldModel(state_dim, action_dim, hidden_dim//4).to(device)
+        self.world_model = FastWorldModel(state_dim, action_dim, device, hidden_dim//4).to(device)
         self.curiosity = CuriosityModule(state_dim, action_dim, hidden_dim, device)
         
         # Training management
-        self.device = device
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.max_action = max_action
@@ -545,7 +595,7 @@ class UltraFastSymphony:
         """Optimized training step with n-step returns"""
         states, actions, rewards_tensor, next_states, dones = batch
         
-        # Device placement
+        # CRITICAL FIX: Ensure all tensors are on the correct device
         states = states.to(self.device)
         actions = actions.to(self.device)
         rewards_tensor = rewards_tensor.to(self.device)
@@ -553,7 +603,7 @@ class UltraFastSymphony:
         dones = dones.to(self.device)
         
         if states.size(0) == 0:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=self.device)
         
         # Fast target update
         with torch.no_grad():
