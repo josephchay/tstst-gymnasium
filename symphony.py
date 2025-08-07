@@ -1,6 +1,6 @@
-# Enhanced Symphony algorithm with World Model and Hybrid Training
-# Addresses all critical issues: proper sequential modeling, stable losses, 
-# ensemble uncertainty, curriculum learning, and computational efficiency
+# Enhanced Symphony algorithm with World Model, Hybrid Training, and Speed Optimizations
+# Includes: Curiosity-driven exploration, prioritized replay, multi-step learning, 
+# optimized architectures, and aggressive training schedules for maximum performance
 
 import torch
 import torch.nn as nn
@@ -16,215 +16,271 @@ torch.manual_seed(830143436)
 np.random.seed(167430301)
 random.seed(2193498338)
 
-# Stable loss functions (replaces unstable ReHE/ReHaE)
+# Optimized loss functions for stability and speed
 def stable_huber_loss(pred, target, delta=1.0):
-    """Numerically stable Huber loss"""
+    """Fast numerically stable Huber loss"""
     abs_error = torch.abs(pred - target)
     quadratic = torch.clamp(abs_error, max=delta)
     linear = abs_error - quadratic
     return torch.mean(0.5 * quadratic**2 + delta * linear)
 
 def stable_mse_loss(pred, target):
-    """Stable MSE with gradient clipping"""
-    error = pred - target
-    return F.mse_loss(pred, target) + 0.01 * torch.mean(error**2)
+    """Stable MSE with regularization"""
+    return F.mse_loss(pred, target) + 0.005 * torch.mean((pred - target)**2)
 
-# Improved activation function
+def compute_n_step_returns(rewards, dones, next_values, gamma=0.99, n_steps=5):
+    """Compute n-step returns for faster learning"""
+    returns = torch.zeros_like(rewards)
+    batch_size = rewards.shape[0]
+    
+    for i in range(batch_size):
+        n_step_return = 0
+        gamma_power = 1
+        
+        for step in range(min(n_steps, batch_size - i)):
+            if i + step < batch_size:
+                n_step_return += gamma_power * rewards[i + step]
+                gamma_power *= gamma
+                
+                if dones[i + step]:
+                    break
+        
+        # Add bootstrapped value if not terminated
+        if i + n_steps < batch_size and not dones[i + n_steps - 1]:
+            n_step_return += gamma_power * next_values[i + n_steps]
+            
+        returns[i] = n_step_return
+    
+    return returns
+
+# Curiosity Module for Exploration
+class CuriosityModule:
+    def __init__(self, state_dim, action_dim, hidden_dim, device):
+        self.device = device
+        
+        # Inverse dynamics model - predicts action from state transitions
+        self.inverse_model = nn.Sequential(
+            nn.Linear(state_dim * 2, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        ).to(device)
+        
+        # Forward dynamics model - predicts next state from state-action
+        self.forward_model = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, state_dim)
+        ).to(device)
+        
+        self.optimizer = optim.Adam(
+            list(self.inverse_model.parameters()) + list(self.forward_model.parameters()),
+            lr=1e-3, weight_decay=1e-5
+        )
+        
+    def compute_intrinsic_reward(self, state, action, next_state):
+        """Compute curiosity-based intrinsic reward"""
+        with torch.no_grad():
+            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            next_state_t = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+            action_t = torch.FloatTensor(action).unsqueeze(0).to(self.device)
+            
+            # Prediction error as curiosity signal
+            pred_next_state = self.forward_model(torch.cat([state_t, action_t], dim=1))
+            curiosity = torch.mean((pred_next_state - next_state_t) ** 2).item()
+            
+            return min(curiosity * 15.0, 2.0)  # Scaled and capped curiosity reward
+    
+    def train_curiosity(self, batch):
+        """Train curiosity module on experience batch"""
+        states, actions, _, next_states, _ = batch
+        
+        # Forward model loss - predict next state
+        pred_next_states = self.forward_model(torch.cat([states, actions], dim=1))
+        forward_loss = F.mse_loss(pred_next_states, next_states)
+        
+        # Inverse model loss - predict action from state transition
+        pred_actions = self.inverse_model(torch.cat([states, next_states], dim=1))
+        inverse_loss = F.mse_loss(pred_actions, actions)
+        
+        total_loss = forward_loss + 0.2 * inverse_loss
+        
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.inverse_model.parameters()) + list(self.forward_model.parameters()), 1.0
+        )
+        self.optimizer.step()
+        
+        return total_loss.item()
+
+# Fast activation functions
 class ReSine(nn.Module):
     def forward(self, x):
         return F.leaky_relu(torch.sin(x), 0.1)
 
-class FourierSeries(nn.Module):
+class FastFourierSeries(nn.Module):
     def __init__(self, hidden_dim, f_out):
         super().__init__()
-        self.fft = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             ReSine(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.05),  # Reduced dropout for speed
             nn.Linear(hidden_dim, f_out)
         )
 
     def forward(self, x):
-        return self.fft(x)
+        return self.net(x)
 
-# World Model Core Architecture
-class WorldModelCore(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128):
+# Optimized Fast Actor
+class FastActor(nn.Module):
+    def __init__(self, state_dim, action_dim, device, max_action=1.0, burst=False, tr_noise=True):
         super().__init__()
-        self.input_dim = state_dim + action_dim
         
-        # GRU for sequential modeling (more stable than LSTM)
-        self.rnn = nn.GRU(self.input_dim, hidden_dim, num_layers=2, 
-                         batch_first=True, dropout=0.1)
+        # Smaller network for speed
+        hidden_dim = 128
         
-        self.state_head = nn.Sequential(
+        self.input = nn.Linear(state_dim, hidden_dim)
+        self.net = nn.Sequential(
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, state_dim)
+            nn.Linear(hidden_dim, action_dim),
+            nn.Tanh()
         )
         
-        self.reward_head = nn.Linear(hidden_dim, 1)
-        self.done_head = nn.Linear(hidden_dim, 1)
+        self.max_action = torch.mean(max_action).item() if hasattr(max_action, '__iter__') else max_action
+        self.noise = OptimizedNoise(max_action, burst, tr_noise)
+        self.device = device
         
-    def forward(self, state_action_seq, hidden=None):
-        rnn_out, hidden = self.rnn(state_action_seq, hidden)
+    def forward(self, state, mean=False):
+        x = self.input(state)
+        x = self.max_action * self.net(x)
         
-        states = self.state_head(rnn_out)
-        rewards = self.reward_head(rnn_out)
-        dones = torch.sigmoid(self.done_head(rnn_out))
-        
-        return states, rewards, dones, hidden
+        if mean:
+            return x
+            
+        x += self.noise.generate(x)
+        return torch.clamp(x, -self.max_action, self.max_action)
 
-# Ensemble World Model for Uncertainty Quantification
-class EnsembleWorldModel(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128, n_models=5):
+# Optimized Fast Critic
+class FastCritic(nn.Module):
+    def __init__(self, state_dim, action_dim):
         super().__init__()
-        self.n_models = n_models
-        self.state_dim = state_dim
-        self.action_dim = action_dim
         
-        self.models = nn.ModuleList([
-            WorldModelCore(state_dim, action_dim, hidden_dim) 
-            for _ in range(n_models)
+        # Optimized smaller network
+        hidden_dim = 128
+        
+        self.input = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+        # Shared trunk with multiple heads for efficiency
+        self.shared = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Q-network heads
+        self.q_heads = nn.ModuleList([
+            nn.Linear(hidden_dim, 1) for _ in range(4)
         ])
         
-        self.optimizers = [optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5) 
-                          for model in self.models]
+    def forward(self, state, action, united=False):
+        x = torch.cat([state, action], dim=-1)
+        x = self.layer_norm(self.input(x))
+        features = self.shared(x)
         
-    def forward(self, state_action_seq):
-        predictions = []
-        for model in self.models:
-            states, rewards, dones, _ = model(state_action_seq)
-            predictions.append((states, rewards, dones))
+        outputs = [head(features) for head in self.q_heads]
         
-        # Stack predictions for ensemble statistics
-        states_stack = torch.stack([p[0] for p in predictions])
-        rewards_stack = torch.stack([p[1] for p in predictions])
-        dones_stack = torch.stack([p[2] for p in predictions])
+        if not united:
+            return outputs
         
-        # Compute ensemble mean and variance
-        state_mean = states_stack.mean(0)
-        state_var = states_stack.var(0) + 1e-6  # Small epsilon for numerical stability
-        reward_mean = rewards_stack.mean(0)
-        done_mean = dones_stack.mean(0)
-        
-        return state_mean, reward_mean, done_mean, state_var
-    
-    def rollout(self, init_state, actions, max_uncertainty=0.1):
-        """Generate multi-step rollouts with uncertainty filtering"""
-        batch_size, seq_len = actions.shape[:2]
-        
-        states_list = []
-        rewards_list = []
-        dones_list = []
-        current_state = init_state
-        
-        for t in range(seq_len):
-            # Create state-action input
-            state_action = torch.cat([current_state, actions[:, t]], dim=-1).unsqueeze(1)
-            
-            # Get ensemble prediction
-            next_state, reward, done, uncertainty = self.forward(state_action)
-            next_state = next_state.squeeze(1)
-            reward = reward.squeeze(1)
-            done = done.squeeze(1)
-            uncertainty = uncertainty.squeeze(1)
-            
-            # Filter by uncertainty - stop rollout if too uncertain
-            avg_uncertainty = torch.mean(uncertainty, dim=-1)
-            if torch.any(avg_uncertainty > max_uncertainty):
-                break
-                
-            states_list.append(next_state)
-            rewards_list.append(reward)
-            dones_list.append(done)
-            current_state = next_state
-            
-            # Stop if episode ends
-            if torch.any(done > 0.5):
-                break
-        
-        if not states_list:
-            return None, None, None
-            
-        return (torch.stack(states_list, 1), 
-                torch.stack(rewards_list, 1), 
-                torch.stack(dones_list, 1))
-    
-    def train_step(self, batch):
-        """Train all models in ensemble"""
-        state_action_seq, target_states, target_rewards, target_dones = batch
-        
-        total_loss = 0
-        for i, (model, optimizer) in enumerate(zip(self.models, self.optimizers)):
-            pred_states, pred_rewards, pred_dones, _ = model(state_action_seq)
-            
-            # Stable losses
-            state_loss = F.mse_loss(pred_states, target_states)
-            reward_loss = F.mse_loss(pred_rewards.squeeze(-1), target_rewards.squeeze(-1))
-            done_loss = F.binary_cross_entropy(pred_dones.squeeze(-1), target_dones.squeeze(-1))
-            
-            loss = state_loss + 0.5 * reward_loss + 0.1 * done_loss
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            total_loss += loss.item()
-            
-        return total_loss / self.n_models
+        # Return min Q-value and variance estimate
+        q_min = torch.min(torch.stack(outputs[:3], dim=-1), dim=-1).values
+        return q_min, outputs[3]
 
-# Sequential Replay Buffer for World Model Training
-class SequentialReplayBuffer:
-    def __init__(self, state_dim, action_dim, capacity, device, seq_len=15):
-        self.capacity = capacity_dict = {"short": 50000, "medium": 150000, "full": 300000}
+# Optimized Noise Generator
+class OptimizedNoise:
+    def __init__(self, max_action, burst=False, tr_noise=True):
+        self.x_coor = 0.0
+        self.tr_noise = tr_noise
+        self.scale = 0.8 if burst else 0.2
+        self.max_action = max_action
+        self.min_noise = 0.03
+        self.exploration_phase_end = 1.8
+        
+    def generate(self, x):
+        # Fast noise generation with optimized schedule
+        if self.tr_noise and self.x_coor >= 2.5:
+            return 0.03 * torch.randn_like(x).clamp(-0.08, 0.08)
+        
+        if self.x_coor >= math.pi:
+            return self.min_noise * torch.randn_like(x).clamp(-0.05, 0.05)
+        
+        # Optimized smooth decay
+        with torch.no_grad():
+            decay_factor = max(0.03, math.cos(self.x_coor / self.exploration_phase_end) + 1.0)
+            eps = self.scale * self.max_action * decay_factor
+            lim = 2.2 * eps
+            self.x_coor += 4e-5
+            return (eps * torch.randn_like(x)).clamp(-lim, lim)
+
+# Prioritized Experience Replay Buffer
+class PrioritizedReplayBuffer:
+    def __init__(self, state_dim, action_dim, capacity, device, alpha=0.6, beta=0.4):
+        # Handle capacity specification
+        capacity_dict = {"short": 80000, "medium": 200000, "full": 400000}
         if isinstance(capacity, str):
             self.capacity = capacity_dict[capacity]
         else:
             self.capacity = capacity
             
-        self.seq_len = seq_len
         self.device = device
+        self.alpha = alpha
+        self.beta = beta
         self.ptr = 0
         self.size = 0
         
-        # Store individual transitions
+        # Storage tensors
         self.states = torch.zeros((self.capacity, state_dim)).to(device)
         self.actions = torch.zeros((self.capacity, action_dim)).to(device)
         self.rewards = torch.zeros((self.capacity, 1)).to(device)
         self.next_states = torch.zeros((self.capacity, state_dim)).to(device)
         self.dones = torch.zeros((self.capacity, 1)).to(device)
-        self.episode_ids = torch.zeros(self.capacity, dtype=torch.long).to(device)
         
-        self.current_episode_id = 0
+        # Priority management
+        self.priorities = torch.ones(self.capacity).to(device)
+        self.max_priority = 1.0
+        
+        # Adaptive batch size
         self.batch_size = 128
         
-        # Normalization parameters
+        # Normalization
         self.min_values = None
         self.max_values = None
         self.normalized = False
         
-    def add(self, state, action, reward, next_state, done):
+    def add(self, state, action, reward, next_state, done, td_error=1.0):
         index = self.ptr % self.capacity
         
+        # Store transition
         self.states[index] = torch.FloatTensor(state).to(self.device)
         self.actions[index] = torch.FloatTensor(action).to(self.device)
         self.rewards[index] = torch.FloatTensor([reward]).to(self.device)
         self.next_states[index] = torch.FloatTensor(next_state).to(self.device)
         self.dones[index] = torch.FloatTensor([done]).to(self.device)
-        self.episode_ids[index] = self.current_episode_id
+        
+        # Set priority
+        priority = (abs(td_error) + 1e-6) ** self.alpha
+        self.priorities[index] = priority
+        self.max_priority = max(self.max_priority, priority)
         
         self.ptr += 1
         self.size = min(self.size + 1, self.capacity)
         
-        if done:
-            self.current_episode_id += 1
-            
-        # Update batch size
-        if self.size > 100:
-            self.batch_size = min(max(128, self.size//500), 1024)
+        # Update batch size adaptively
+        if self.size > 200:
+            self.batch_size = min(max(128, self.size//400), 512)
     
     def find_min_max(self):
         """Calculate normalization parameters"""
@@ -235,7 +291,7 @@ class SequentialReplayBuffer:
         self.min_values = torch.min(self.states[:actual_length], dim=0).values
         self.max_values = torch.max(self.states[:actual_length], dim=0).values
         
-        # Handle inf values
+        # Handle edge cases
         self.min_values[torch.isinf(self.min_values)] = -1e3
         self.max_values[torch.isinf(self.max_values)] = 1e3
         
@@ -256,179 +312,104 @@ class SequentialReplayBuffer:
         return state
     
     def sample(self):
-        """Sample individual transitions"""
-        if self.size < self.batch_size:
-            indices = torch.arange(self.size)
-        else:
-            indices = torch.randint(0, self.size, (self.batch_size,))
+        """Sample with priority weighting"""
+        if self.size == 0:
+            return None, None, None
+            
+        # Compute sampling probabilities
+        valid_priorities = self.priorities[:self.size]
+        probs = valid_priorities / torch.sum(valid_priorities)
         
-        return (
+        # Sample indices
+        batch_size = min(self.batch_size, self.size)
+        indices = torch.multinomial(probs, batch_size, replacement=True)
+        
+        # Importance sampling weights
+        weights = (self.size * probs[indices]) ** (-self.beta)
+        weights = weights / torch.max(weights)
+        
+        batch = (
             self.normalize(self.states[indices]),
             self.actions[indices],
             self.rewards[indices],
             self.normalize(self.next_states[indices]),
             self.dones[indices]
         )
+        
+        return batch, weights, indices
     
-    def sample_sequences(self, batch_size=32):
-        """Sample sequences for world model training"""
-        if self.size < self.seq_len * 2:
-            return None
-            
-        # Find valid sequence starting points
-        valid_starts = []
-        for i in range(self.size - self.seq_len):
-            if (self.episode_ids[i] == self.episode_ids[i + self.seq_len - 1] and
-                torch.all(self.dones[i:i+self.seq_len-1] < 0.5)):
-                valid_starts.append(i)
-        
-        if len(valid_starts) < batch_size:
-            return None
-        
-        # Sample starting indices
-        start_indices = np.random.choice(valid_starts, batch_size, replace=False)
-        
-        # Build sequences
-        state_action_seqs = []
-        target_states = []
-        target_rewards = []
-        target_dones = []
-        
-        for start_idx in start_indices:
-            end_idx = start_idx + self.seq_len
-            
-            # State-action sequence
-            states_seq = self.normalize(self.states[start_idx:end_idx])
-            actions_seq = self.actions[start_idx:end_idx]
-            state_action_seq = torch.cat([states_seq, actions_seq], dim=-1)
-            
-            # Targets
-            next_states_seq = self.normalize(self.next_states[start_idx:end_idx])
-            rewards_seq = self.rewards[start_idx:end_idx]
-            dones_seq = self.dones[start_idx:end_idx]
-            
-            state_action_seqs.append(state_action_seq)
-            target_states.append(next_states_seq)
-            target_rewards.append(rewards_seq)
-            target_dones.append(dones_seq)
-        
-        return (
-            torch.stack(state_action_seqs),
-            torch.stack(target_states),
-            torch.stack(target_rewards),
-            torch.stack(target_dones)
-        )
+    def update_priorities(self, indices, td_errors):
+        """Update priorities based on TD errors"""
+        for idx, td_error in zip(indices, td_errors):
+            priority = (abs(td_error) + 1e-6) ** self.alpha
+            self.priorities[idx] = priority
     
     def __len__(self):
         return self.size
 
-# Fixed Actor with Stable Exploration
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, device, hidden_dim=256, max_action=1.0, burst=False, tr_noise=True):
-        super(Actor, self).__init__()
+# World Model for Dreaming (simplified for speed)
+class FastWorldModel(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
+        super().__init__()
         
-        self.input = nn.Linear(state_dim, hidden_dim)
+        # Compact world model
+        self.input_dim = state_dim + action_dim
+        
         self.net = nn.Sequential(
-            FourierSeries(hidden_dim, hidden_dim),
+            nn.Linear(self.input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Tanh()
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, state_dim + 1 + 1)  # next_state + reward + done
         )
         
-        self.max_action = torch.mean(max_action).item() if hasattr(max_action, '__iter__') else max_action
-        self.noise = StableNoise(max_action, burst, tr_noise)
-        self.device = device
+        self.optimizer = optim.Adam(self.parameters(), lr=2e-4)
         
-    def forward(self, state, mean=False):
-        x = self.input(state)
-        x = self.max_action * self.net(x)
-        
-        if mean:
-            return x
-            
-        x += self.noise.generate(x)
-        return torch.clamp(x, -self.max_action, self.max_action)
-
-# Fixed Critic with Stable Architecture
-class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(Critic, self).__init__()
-        
-        self.input = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        
-        # Three Q-networks + variance estimator
-        networks = []
-        for _ in range(4):
-            net = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, 1)
-            )
-            networks.append(net)
-        
-        self.networks = nn.ModuleList(networks)
-        
-    def forward(self, state, action, united=False):
+    def forward(self, state, action):
         x = torch.cat([state, action], dim=-1)
-        x = self.layer_norm(self.input(x))
+        out = self.net(x)
         
-        outputs = [net(x) for net in self.networks]
+        next_state = out[:, :-2]
+        reward = out[:, -2:-1]
+        done = torch.sigmoid(out[:, -1:])
         
-        if not united:
-            return outputs
+        return next_state, reward, done
+    
+    def train_step(self, batch):
+        """Fast world model training"""
+        states, actions, rewards, next_states, dones = batch
         
-        # Return min Q-value and variance estimate
-        q_min = torch.min(torch.stack(outputs[:3], dim=-1), dim=-1).values
-        return q_min, outputs[3]
+        pred_next_states, pred_rewards, pred_dones = self.forward(states, actions)
+        
+        # Simple losses for speed
+        state_loss = F.mse_loss(pred_next_states, next_states)
+        reward_loss = F.mse_loss(pred_rewards, rewards)
+        done_loss = F.binary_cross_entropy(pred_dones, dones)
+        
+        loss = state_loss + 0.5 * reward_loss + 0.1 * done_loss
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
+        self.optimizer.step()
+        
+        return loss.item()
 
-# Stable Noise Generator
-class StableNoise:
-    def __init__(self, max_action, burst=False, tr_noise=True):
-        self.x_coor = 0.0
-        self.tr_noise = tr_noise
-        self.scale = 0.8 if burst else 0.15
-        self.max_action = max_action
-        self.min_noise = 0.05
-        self.exploration_phase_end = 2.0
-        
-    def generate(self, x):
-        if self.tr_noise and self.x_coor >= 2.5:
-            return 0.05 * torch.randn_like(x).clamp(-0.1, 0.1)
-        
-        if self.x_coor >= math.pi:
-            return self.min_noise * torch.randn_like(x).clamp(-0.1, 0.1)
-        
-        # Smooth decay
-        with torch.no_grad():
-            decay_factor = max(0.05, math.cos(self.x_coor / self.exploration_phase_end) + 1.0)
-            eps = self.scale * self.max_action * decay_factor
-            lim = 2.0 * eps
-            self.x_coor += 2e-5
-            return (eps * torch.randn_like(x)).clamp(-lim, lim)
-
-# Enhanced Noise (backward compatibility)
-class EnhancedNoise(StableNoise):
-    pass
-
-class GANoise(StableNoise):
-    pass
-
-# Hybrid Symphony with World Model Integration
-class HybridSymphony:
+# Ultra-Fast Symphony with All Optimizations
+class UltraFastSymphony:
     def __init__(self, state_dim, action_dim, hidden_dim, device, max_action=1.0, burst=False, tr_noise=True):
-        # Core Symphony components
-        self.actor = Actor(state_dim, action_dim, device, hidden_dim, max_action, burst, tr_noise).to(device)
-        self.critic = Critic(state_dim, action_dim, hidden_dim).to(device)
+        # Optimized components
+        self.actor = FastActor(state_dim, action_dim, device, max_action, burst, tr_noise).to(device)
+        self.critic = FastCritic(state_dim, action_dim).to(device)
         self.critic_target = copy.deepcopy(self.critic)
         
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4, weight_decay=1e-5)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4, weight_decay=1e-5)
+        # Fast optimizers with higher learning rates
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=5e-4, weight_decay=1e-6)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3, weight_decay=1e-6)
         
-        # World model components
-        self.world_model = EnsembleWorldModel(state_dim, action_dim, hidden_dim).to(device)
+        # World model and curiosity
+        self.world_model = FastWorldModel(state_dim, action_dim, hidden_dim//4).to(device)
+        self.curiosity = CuriosityModule(state_dim, action_dim, hidden_dim, device)
         
         # Training management
         self.device = device
@@ -436,20 +417,17 @@ class HybridSymphony:
         self.action_dim = action_dim
         self.max_action = max_action
         
-        # World model tracking
-        self.world_model_loss_history = []
+        # Fast learning parameters
         self.world_model_ready = False
-        self.model_accuracy_threshold = 0.05
-        
-        # Curriculum learning
+        self.world_model_loss_threshold = 0.1  # More lenient threshold
         self.dream_ratio = 0.0
-        self.max_dream_ratio = 0.3
-        self.curriculum_step = 0.01
+        self.max_dream_ratio = 0.4
         
-        # Symphony state tracking
+        # Training tracking
         self.q_old_policy = 0.0
         self.s2_old_policy = 0.0
         self.tr_step = 0
+        self.world_model_losses = []
         
     def select_action(self, state, replay_buffer=None, mean=False):
         with torch.no_grad():
@@ -459,116 +437,118 @@ class HybridSymphony:
             action = self.actor(state, mean=mean)
             return action.cpu().data.numpy().flatten()
     
-    def train_world_model(self, seq_buffer, n_epochs=50):
-        """Train world model ensemble"""
-        print("Training world model ensemble...")
+    def train_world_model(self, replay_buffer, n_epochs=15):
+        """Fast world model training"""
+        if len(replay_buffer) < 500:
+            return []
         
-        epoch_losses = []
+        losses = []
         for epoch in range(n_epochs):
-            batch = seq_buffer.sample_sequences(32)
-            if batch is None:
+            if hasattr(replay_buffer, 'sample'):
+                sample_result = replay_buffer.sample()
+                if sample_result is None:
+                    continue
+                    
+                if len(sample_result) == 3:  # Prioritized buffer
+                    batch, _, _ = sample_result
+                else:  # Regular batch
+                    batch = sample_result
+            else:
                 continue
                 
             loss = self.world_model.train_step(batch)
-            epoch_losses.append(loss)
-            
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}, Loss: {loss:.6f}")
+            losses.append(loss)
         
-        if epoch_losses:
-            avg_loss = np.mean(epoch_losses[-10:])
-            self.world_model_loss_history.append(avg_loss)
+        if losses:
+            avg_loss = np.mean(losses[-5:])  # Last 5 epochs
+            self.world_model_losses.append(avg_loss)
             
-            if avg_loss < self.model_accuracy_threshold:
+            # Aggressive readiness threshold
+            if avg_loss < self.world_model_loss_threshold:
                 self.world_model_ready = True
-                print(f"World model ready! Final loss: {avg_loss:.6f}")
-            else:
-                print(f"World model needs more training. Loss: {avg_loss:.6f}")
+                self.dream_ratio = 0.1  # Start dreaming immediately
+                print(f"World model ready! Loss: {avg_loss:.4f}")
         
-        return epoch_losses
+        return losses
     
-    def update_curriculum(self):
-        """Update dream ratio based on model performance"""
-        if not self.world_model_ready or not self.world_model_loss_history:
-            self.dream_ratio = 0.0
-            return
-        
-        recent_loss = self.world_model_loss_history[-1]
-        
-        if recent_loss < self.model_accuracy_threshold * 0.5:
-            self.dream_ratio = min(self.max_dream_ratio, 
-                                 self.dream_ratio + self.curriculum_step)
-        elif recent_loss > self.model_accuracy_threshold * 2:
-            self.dream_ratio = max(0.0, self.dream_ratio - self.curriculum_step * 2)
-        
-        print(f"Dream ratio: {self.dream_ratio:.3f}, Model loss: {recent_loss:.6f}")
-    
-    def generate_dreams(self, real_batch, n_dreams=30, dream_length=12):
-        """Generate synthetic rollouts"""
-        if not self.world_model_ready or self.dream_ratio == 0:
+    def generate_dreams(self, real_batch, n_dreams=25, dream_length=8):
+        """Fast dream generation"""
+        if not self.world_model_ready:
             return None
-        
+            
         states, actions, rewards, next_states, dones = real_batch
         batch_size = min(n_dreams, states.shape[0])
         
         # Sample initial states
         init_indices = torch.randint(0, states.shape[0], (batch_size,))
-        init_states = states[init_indices]
+        current_state = states[init_indices]
         
-        # Generate actions using current policy
+        # Generate short rollouts
+        dream_states = [current_state]
         dream_actions = []
-        current_state = init_states
+        dream_rewards = []
+        dream_dones = []
         
-        for _ in range(dream_length):
+        for step in range(dream_length):
             with torch.no_grad():
                 action = self.actor(current_state, mean=True)
+                next_state, reward, done = self.world_model(current_state, action)
+                
+                # Add small noise for diversity
+                next_state += 0.01 * torch.randn_like(next_state)
+                
                 dream_actions.append(action)
-                # Add small noise to prevent deterministic rollouts
-                current_state = current_state + 0.01 * torch.randn_like(current_state)
+                dream_rewards.append(reward)
+                dream_dones.append(done)
+                dream_states.append(next_state)
+                
+                current_state = next_state
+                
+                # Early termination
+                if torch.any(done > 0.5):
+                    break
         
-        dream_actions = torch.stack(dream_actions, dim=1)
-        
-        # Generate rollouts
-        dream_states, dream_rewards, dream_dones = self.world_model.rollout(
-            init_states, dream_actions, max_uncertainty=0.1
-        )
-        
-        if dream_states is None:
+        if len(dream_actions) == 0:
             return None
         
         # Format as transitions
-        seq_len = dream_states.shape[1]
-        
-        # Flatten sequences
-        flat_states = dream_states[:, :-1].reshape(-1, self.state_dim)
-        flat_next_states = dream_states[:, 1:].reshape(-1, self.state_dim)
-        flat_actions = dream_actions[:, :seq_len-1].reshape(-1, self.action_dim)
-        flat_rewards = dream_rewards[:, :seq_len-1].reshape(-1, 1)
-        flat_dones = dream_dones[:, :seq_len-1].reshape(-1, 1)
+        flat_states = torch.cat(dream_states[:-1], dim=0)
+        flat_next_states = torch.cat(dream_states[1:], dim=0)
+        flat_actions = torch.cat(dream_actions, dim=0)
+        flat_rewards = torch.cat(dream_rewards, dim=0)
+        flat_dones = torch.cat(dream_dones, dim=0)
         
         return (flat_states, flat_actions, flat_rewards, flat_next_states, flat_dones)
     
     def train(self, real_batch, dream_batch=None):
-        """Hybrid training with curriculum learning"""
+        """Ultra-fast training with all optimizations"""
         self.tr_step += 1
         
-        # Always train on real data
-        real_loss = self.train_symphony(real_batch, weight=1.0 - self.dream_ratio)
+        # Determine training weights
+        real_weight = 1.0 - self.dream_ratio
+        dream_weight = self.dream_ratio
+        
+        # Train on real data
+        real_loss = self.train_step(real_batch, weight=real_weight)
         
         total_loss = real_loss
         
-        # Train on dreams if available
-        if dream_batch is not None and self.dream_ratio > 0:
-            dream_loss = self.train_symphony(dream_batch, weight=self.dream_ratio)
-            total_loss = real_loss + dream_loss
+        # Train on dreams
+        if dream_batch is not None and dream_weight > 0:
+            dream_loss = self.train_step(dream_batch, weight=dream_weight)
+            total_loss += dream_loss
+        
+        # Update dream ratio aggressively
+        if self.world_model_ready:
+            self.dream_ratio = min(self.max_dream_ratio, self.dream_ratio + 0.002)
         
         return total_loss
     
-    def train_symphony(self, batch, weight=1.0):
-        """Core Symphony training with stable losses"""
+    def train_step(self, batch, weight=1.0):
+        """Optimized training step with n-step returns"""
         states, actions, rewards, next_states, dones = batch
         
-        # Ensure proper device placement
+        # Device placement
         states = states.to(self.device)
         actions = actions.to(self.device)
         rewards = rewards.to(self.device)
@@ -578,29 +558,28 @@ class HybridSymphony:
         if states.size(0) == 0:
             return torch.tensor(0.0)
         
-        # Critic update
+        # Fast target update
         with torch.no_grad():
-            # Soft target update
             for target_param, param in zip(self.critic_target.parameters(), 
                                          self.critic.parameters()):
                 target_param.data.copy_(0.995 * target_param.data + 0.005 * param.data)
             
             next_actions = self.actor(next_states, mean=True)
-            q_next_target, s2_next_target = self.critic_target(next_states, next_actions, united=True)
-            q_target = rewards + (1 - dones) * 0.99 * q_next_target
-            s2_target = 0.01 * torch.ones_like(rewards)
+            q_next_target, _ = self.critic_target(next_states, next_actions, united=True)
+            
+            # Use 3-step returns for faster learning
+            n_step_targets = compute_n_step_returns(rewards, dones, q_next_target, n_steps=3)
         
-        # Current Q-values
+        # Critic update with n-step targets
         current_qs = self.critic(states, actions, united=False)
         
-        # Stable critic loss
-        critic_loss = sum(stable_mse_loss(q, q_target) for q in current_qs[:3])
-        critic_loss += stable_mse_loss(current_qs[3], s2_target)
+        critic_loss = sum(stable_mse_loss(q, n_step_targets) for q in current_qs[:3])
+        critic_loss += stable_mse_loss(current_qs[3], 0.01 * torch.ones_like(rewards))
         critic_loss *= weight
         
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimizer.step()
         
         # Actor update
@@ -611,7 +590,7 @@ class HybridSymphony:
         
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
         
         # Update tracking
@@ -621,20 +600,43 @@ class HybridSymphony:
         
         return critic_loss + actor_loss
 
-# Backward compatibility classes
-class Symphony(HybridSymphony):
-    """Backward compatible Symphony class"""
-    def __init__(self, state_dim, action_dim, hidden_dim, device, max_action=1.0, burst=False, tr_noise=True):
-        super().__init__(state_dim, action_dim, hidden_dim, device, max_action, burst, tr_noise)
+# Adaptive training frequency function
+def get_adaptive_training_freq(episode, buffer_size):
+    """Dynamic training frequency based on data availability"""
+    if buffer_size < 1000:
+        return 1
+    elif buffer_size < 10000:
+        return min(6, buffer_size // 200)
+    else:
+        return min(12, buffer_size // 800)
 
-class ReplayBuffer(SequentialReplayBuffer):
+# Backward compatibility classes
+class Symphony(UltraFastSymphony):
+    """Backward compatible Symphony class"""
+    pass
+
+class ReplayBuffer(PrioritizedReplayBuffer):
     """Backward compatible ReplayBuffer class"""
     def __init__(self, state_dim, action_dim, capacity, device, fade_factor=7.0, stall_penalty=0.03):
         super().__init__(state_dim, action_dim, capacity, device)
-        self.fade_factor = fade_factor
-        self.stall_penalty = stall_penalty
 
-# Legacy noise classes for compatibility
+class EnhancedReplayBuffer(PrioritizedReplayBuffer):
+    """Enhanced buffer alias"""
+    pass
+
+# Legacy classes
+class Actor(FastActor):
+    pass
+
+class Critic(FastCritic):
+    pass
+
+class EnhancedNoise(OptimizedNoise):
+    pass
+
+class GANoise(OptimizedNoise):
+    pass
+
 class OUNoise:
     def __init__(self, action_dim, device, mu=0, theta=0.15, sigma=0.2):
         self.action_dim = action_dim
@@ -655,7 +657,7 @@ class OUNoise:
         
         with torch.no_grad():
             eps = (math.cos(self.x_coor) + 1.0)
-            self.x_coor += 7e-4
+            self.x_coor += 1e-3
             
             dx = self.theta * (self.mu - self.state) + self.sigma * torch.randn_like(self.state)
             self.state = self.state + dx
