@@ -230,7 +230,7 @@ load_models_and_buffer()
 print(f"Starting ultra-fast training from episode {start_episode}")
 
 for episode in range(start_episode, num_episodes):
-    rewards = []
+    episode_rewards = []  # Fixed: use episode_rewards instead of rewards to avoid conflict
     state = env.reset()[0]
     
     # Adaptive training parameters
@@ -266,11 +266,11 @@ for episode in range(start_episode, num_episodes):
             if weights is not None and indices is not None:
                 # Compute TD errors for priority update
                 with torch.no_grad():
-                    states, actions, rewards, next_states, dones = real_batch
+                    states, actions, rewards_tensor, next_states, dones = real_batch
                     current_qs = algo.critic(states, actions, united=False)
                     next_actions = algo.actor(next_states, mean=True)
                     next_q_target, _ = algo.critic_target(next_states, next_actions, united=True)
-                    td_targets = rewards + (1 - dones) * 0.99 * next_q_target
+                    td_targets = rewards_tensor + (1 - dones) * 0.99 * next_q_target
                     td_errors = [abs(q - td_targets).mean().item() for q in current_qs[:3]]
                     avg_td_error = np.mean(td_errors)
                     replay_buffer.update_priorities(indices, [avg_td_error] * len(indices))
@@ -310,7 +310,7 @@ for episode in range(start_episode, num_episodes):
             action = algo.select_action(state, replay_buffer)
         
         next_state, reward, done, info, _ = env.step(action)
-        rewards.append(reward)
+        episode_rewards.append(reward)  # Fixed: use episode_rewards list
         
         # Environment-specific reward modifications
         modified_reward = reward
@@ -392,8 +392,8 @@ for episode in range(start_episode, num_episodes):
         if done:
             break
     
-    # Record episode results
-    total_rewards.append(np.sum(rewards))
+    # Record episode results - Fixed: use episode_rewards
+    total_rewards.append(np.sum(episode_rewards))
     total_steps.append(episode_steps)
     average_reward = np.mean(total_rewards[-100:])
     

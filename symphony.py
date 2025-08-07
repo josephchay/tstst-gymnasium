@@ -124,7 +124,7 @@ class FastFourierSeries(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             ReSine(),
-            nn.Dropout(0.05),  # Reduced dropout for speed
+            nn.Dropout(0.05),
             nn.Linear(hidden_dim, f_out)
         )
 
@@ -444,17 +444,14 @@ class UltraFastSymphony:
         
         losses = []
         for epoch in range(n_epochs):
-            if hasattr(replay_buffer, 'sample'):
-                sample_result = replay_buffer.sample()
-                if sample_result is None:
-                    continue
-                    
-                if len(sample_result) == 3:  # Prioritized buffer
-                    batch, _, _ = sample_result
-                else:  # Regular batch
-                    batch = sample_result
-            else:
+            sample_result = replay_buffer.sample()
+            if sample_result is None:
                 continue
+                
+            if len(sample_result) == 3:  # Prioritized buffer
+                batch, _, _ = sample_result
+            else:  # Regular batch
+                batch = sample_result
                 
             loss = self.world_model.train_step(batch)
             losses.append(loss)
@@ -476,7 +473,7 @@ class UltraFastSymphony:
         if not self.world_model_ready:
             return None
             
-        states, actions, rewards, next_states, dones = real_batch
+        states, actions, rewards_batch, next_states, dones = real_batch
         batch_size = min(n_dreams, states.shape[0])
         
         # Sample initial states
@@ -486,7 +483,7 @@ class UltraFastSymphony:
         # Generate short rollouts
         dream_states = [current_state]
         dream_actions = []
-        dream_rewards = []
+        dream_rewards_list = []
         dream_dones = []
         
         for step in range(dream_length):
@@ -498,7 +495,7 @@ class UltraFastSymphony:
                 next_state += 0.01 * torch.randn_like(next_state)
                 
                 dream_actions.append(action)
-                dream_rewards.append(reward)
+                dream_rewards_list.append(reward)
                 dream_dones.append(done)
                 dream_states.append(next_state)
                 
@@ -515,7 +512,7 @@ class UltraFastSymphony:
         flat_states = torch.cat(dream_states[:-1], dim=0)
         flat_next_states = torch.cat(dream_states[1:], dim=0)
         flat_actions = torch.cat(dream_actions, dim=0)
-        flat_rewards = torch.cat(dream_rewards, dim=0)
+        flat_rewards = torch.cat(dream_rewards_list, dim=0)
         flat_dones = torch.cat(dream_dones, dim=0)
         
         return (flat_states, flat_actions, flat_rewards, flat_next_states, flat_dones)
@@ -546,12 +543,12 @@ class UltraFastSymphony:
     
     def train_step(self, batch, weight=1.0):
         """Optimized training step with n-step returns"""
-        states, actions, rewards, next_states, dones = batch
+        states, actions, rewards_tensor, next_states, dones = batch
         
         # Device placement
         states = states.to(self.device)
         actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
+        rewards_tensor = rewards_tensor.to(self.device)
         next_states = next_states.to(self.device)
         dones = dones.to(self.device)
         
@@ -568,13 +565,13 @@ class UltraFastSymphony:
             q_next_target, _ = self.critic_target(next_states, next_actions, united=True)
             
             # Use 3-step returns for faster learning
-            n_step_targets = compute_n_step_returns(rewards, dones, q_next_target, n_steps=3)
+            n_step_targets = compute_n_step_returns(rewards_tensor, dones, q_next_target, n_steps=3)
         
         # Critic update with n-step targets
         current_qs = self.critic(states, actions, united=False)
         
         critic_loss = sum(stable_mse_loss(q, n_step_targets) for q in current_qs[:3])
-        critic_loss += stable_mse_loss(current_qs[3], 0.01 * torch.ones_like(rewards))
+        critic_loss += stable_mse_loss(current_qs[3], 0.01 * torch.ones_like(rewards_tensor))
         critic_loss *= weight
         
         self.critic_optimizer.zero_grad()
